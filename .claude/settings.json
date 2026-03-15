@@ -1,0 +1,35 @@
+{
+  "enabledPlugins": {
+    "jarvis@jarvis-marketplace": true
+  },
+  "permissions": {
+    "allow": [
+      "Read(.jarvis/**)",
+      "Read(~/.claude/plugins/cache/**)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/plugins/cache/jarvis-marketplace/jarvis/0.1.0/skills/jarvis-reload/hooks/jarvis-session-start.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/plugins/cache/jarvis-marketplace/jarvis/0.1.0/skills/jarvis-reflect/hooks/jarvis-stop.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

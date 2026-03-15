@@ -1,0 +1,8 @@
+results/*
+!results/.gitkeep
+workspaces/*
+!workspaces/.gitkeep
+vendor/
+__pycache__/
+*.egg-info/
+.venv/

@@ -9,6 +9,8 @@ from harness.config import (
     TaskSpec,
     TaskTestData,
     TestResult,
+    load_batch_result,
+    load_run_result,
 )
 from harness.grader import grade_batch, grade_run
 from harness.reporter import generate_report, generate_report_from_grades
@@ -27,6 +29,8 @@ __all__ = [
     "generate_report_from_grades",
     "grade_batch",
     "grade_run",
+    "load_batch_result",
+    "load_run_result",
     "run_evaluation",
     "run_full_benchmark",
     "run_task",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -219,7 +220,6 @@ def load_task_spec(task_name: str, config: BenchConfig) -> TaskSpec:
 
 def load_task_test_data(task_name: str, config: BenchConfig) -> TaskTestData:
     """Load test configuration for a task from NL2RepoBench."""
-    import json
 
     task_dir = config.test_files_dir / task_name
     if not task_dir.is_dir():
@@ -275,3 +275,42 @@ def generate_batch_id() -> str:
     """Generate a unique batch ID: batch_{YYYYMMDD-HHMMSS}."""
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"batch_{timestamp}"
+
+
+def load_run_result(run_id: str, config: BenchConfig) -> RunResult:
+    """Load a RunResult from results/{run_id}/raw/result.json."""
+    result_path = config.results_dir / run_id / "raw" / "result.json"
+    if not result_path.exists():
+        raise FileNotFoundError(f"Run result not found: {result_path}")
+    data = json.loads(result_path.read_text(encoding="utf-8"))
+    return RunResult(
+        run_id=data["run_id"],
+        task_name=data["task_name"],
+        condition=Condition(data["condition"]),
+        workspace_path=Path(data["workspace_path"]),
+        exit_code=data["exit_code"],
+        wall_clock_seconds=data["wall_clock_seconds"],
+        started_at=data["started_at"],
+        finished_at=data["finished_at"],
+        timed_out=data["timed_out"],
+        raw_stdout=data["raw_stdout"],
+        raw_stderr=data["raw_stderr"],
+        claude_output=data["claude_output"],
+        files_generated=data["files_generated"],
+    )
+
+
+def load_batch_result(batch_id: str, config: BenchConfig) -> BatchResult:
+    """Load a BatchResult from results/{batch_id}/manifest.json."""
+    manifest_path = config.results_dir / batch_id / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Batch manifest not found: {manifest_path}")
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    results = [
+        load_run_result(run["run_id"], config) for run in data["runs"]
+    ]
+    return BatchResult(
+        batch_id=data["batch_id"],
+        results=results,
+        manifest_path=manifest_path,
+    )

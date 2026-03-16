@@ -16,6 +16,9 @@ dependencies = [
     "click>=8.1",
 ]
 
+[project.scripts]
+jarvis-bench = "harness.__main__:cli"
+
 [project.optional-dependencies]
 dev = [
     "ruff>=0.5",

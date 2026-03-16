@@ -4,7 +4,7 @@
   },
   "permissions": {
     "allow": [
-      "Read(.jarvis/**)",
+      "Read(~/.jarvis/**)",
       "Read(~/.claude/plugins/cache/**)"
     ]
   },

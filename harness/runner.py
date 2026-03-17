@@ -18,7 +18,6 @@ from harness.config import (
     BenchConfig,
     Condition,
     RunResult,
-    TaskSpec,
     discover_tasks,
     generate_batch_id,
     generate_run_id,
@@ -96,7 +95,7 @@ def _scaffold_jarvis_dir(workspace: Path, scaffolding_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_prompt(task_spec: TaskSpec, condition: Condition) -> str:
+def build_prompt(condition: Condition) -> str:
     """Build the prompt to send to Claude Code for the given condition."""
     if condition == Condition.BASELINE:
         return _build_baseline_prompt()
@@ -106,8 +105,7 @@ def build_prompt(task_spec: TaskSpec, condition: Condition) -> str:
         raise NotImplementedError(
             f"Condition {condition.value!r} is not yet implemented."
         )
-    else:
-        raise ValueError(f"Unknown condition: {condition!r}")
+    raise ValueError(f"Unknown condition: {condition!r}")
 
 
 def _build_baseline_prompt() -> str:
@@ -123,11 +121,13 @@ Work autonomously — implement everything in a single session without asking qu
 def _build_jarvis_prompted_prompt() -> str:
     return """You are an expert Python developer. Your task is to create a complete Python project based on the specification in `start.md` (already present in your working directory).
 
-**Before writing any code**, create a PLAN.md file that breaks down the implementation into logical steps. At the end of each phase in the plan, include a reminder to run `/jarvis-reflect` before moving on.
-
-As you work through implementation, use `/jarvis-reflect` after completing each phase to capture what you learned, what worked, and what didn't. This helps you maintain coherence across a long implementation.
+**Before writing any code**, create a PLAN.md file that breaks down the implementation into logical steps.
 
 Read `start.md` carefully and implement all required functionality. Create all necessary files, directories, modules, and tests. The project must be installable and all tests must pass.
+
+## MANDATORY: Reflection after each phase
+
+After completing each major phase of your plan, you MUST run `/jarvis-reflect` before moving to the next phase. This is non-negotiable — do not skip it, do not do it manually. Use the Skill tool to invoke it. The reflection writes to `.jarvis/journal/` and captures what you learned. This keeps you coherent across a long implementation.
 
 Work autonomously — implement everything in a single session without asking questions."""
 
@@ -205,13 +205,16 @@ def invoke_claude(
 
 def list_workspace_files(workspace: Path) -> list[str]:
     """List files generated in the workspace, excluding .claude/ and .jarvis/ dirs."""
-    excluded_prefixes = (".claude", ".jarvis")
+    excluded_prefixes = (".claude", ".claude-home", ".jarvis")
+    excluded_files = {".claude.json"}  # auth copy from Docker runner
     files: list[str] = []
     for path in workspace.rglob("*"):
         if not path.is_file():
             continue
         rel = path.relative_to(workspace)
         if any(rel.parts[0] == prefix for prefix in excluded_prefixes if rel.parts):
+            continue
+        if rel.name in excluded_files and len(rel.parts) == 1:
             continue
         files.append(str(rel))
     return sorted(files)
@@ -242,7 +245,7 @@ def run_task(
     if condition in (Condition.JARVIS_PROMPTED, Condition.JARVIS_ORCHESTRATED):
         setup_jarvis_workspace(workspace, config)
 
-    prompt = build_prompt(task_spec, condition)
+    prompt = build_prompt(condition)
 
     started_at = datetime.now(timezone.utc).isoformat()
     start_time = time.monotonic()

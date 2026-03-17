@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -91,23 +93,37 @@ def run_claude_in_container(
 
     # Start container in detached mode
     # Use host UID/GID so mounted auth files are readable
-    import os
     host_uid = os.getuid()
     host_gid = os.getgid()
 
+    # Build a minimal writable ~/.claude for the container.
+    # Claude CLI needs: settings.json (config), session-env/ (Bash tool),
+    # and ~/.claude.json (auth + Skill tool writes to it).
+    # We do NOT copy plugins/, projects/, telemetry/, etc. (~350MB of junk).
+    workspace_claude_dir = workspace / ".claude-home"
+    workspace_claude_dir.mkdir(parents=True, exist_ok=True)
+    claude_home_path = Path(claude_home)
+    for fname in ("settings.json", ".credentials.json"):
+        src = claude_home_path / fname
+        if src.exists():
+            shutil.copy2(src, workspace_claude_dir / fname)
+    (workspace_claude_dir / "session-env").mkdir(exist_ok=True)
+    workspace_claude_json = workspace / ".claude.json"
+    if claude_json.exists():
+        shutil.copy2(claude_json, workspace_claude_json)
+
     volume_mounts = [
         "-v", f"{abs_workspace}:/workspace:rw",
-        "-v", f"{claude_home}:/home/claude/.claude:ro",
+        "-v", f"{workspace_claude_dir.resolve()}:/home/pn/.claude:rw",
+        "-v", f"{workspace_claude_json.resolve()}:/home/pn/.claude.json:rw",
     ]
-    # Mount ~/.claude.json for auth if it exists
-    if claude_json.exists():
-        volume_mounts.extend(["-v", f"{claude_json}:/home/claude/.claude.json:ro"])
 
     run_cmd = [
         "docker", "run", "-d",
         "--name", container_name,
         "--user", f"{host_uid}:{host_gid}",
-        "-e", "HOME=/home/claude",
+        "-e", "HOME=/home/pn",
+        "-e", "JARVIS_DIR=/workspace/.jarvis",
         *volume_mounts,
         "-w", "/workspace",
         f"--memory={config.docker_memory}",
@@ -165,6 +181,11 @@ def run_claude_in_container(
         return stdout, stderr, exit_code, timed_out
 
     finally:
+        # Remove copied auth files from workspace
+        if workspace_claude_json.exists():
+            workspace_claude_json.unlink(missing_ok=True)
+        if workspace_claude_dir.exists():
+            shutil.rmtree(workspace_claude_dir, ignore_errors=True)
         # Cleanup container
         for cmd in [
             ["docker", "rm", "-f", container_name],

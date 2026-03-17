@@ -1,6 +1,7 @@
-FROM node:20-slim
+FROM nikolaik/python-nodejs:python3.12-nodejs22
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git build-essential \
+    && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @anthropic-ai/claude-code
-RUN useradd -m claude
-USER claude
 WORKDIR /workspace
 ENTRYPOINT ["claude"]

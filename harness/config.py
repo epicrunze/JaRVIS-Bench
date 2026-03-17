@@ -185,7 +185,7 @@ class BenchConfig:
 
     # Claude settings
     claude_command: str = "claude"
-    model: str = "claude-sonnet-4-20250514"
+    model: str = "claude-sonnet-4-6"
     timeout_seconds: int = 3600
     max_budget_usd: float | None = None
     max_turns: int | None = None
@@ -198,7 +198,7 @@ class BenchConfig:
     docker_cpus: int = 4
 
     # LLM judge settings
-    judge_model: str = "claude-sonnet-4-20250514"
+    judge_model: str = "claude-sonnet-4-6"
 
     # Eval settings
     conditions: list[Condition] = field(

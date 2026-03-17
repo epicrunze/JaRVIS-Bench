@@ -9,7 +9,7 @@ Each NL2Repo-Bench task is run under two primary conditions:
 | | Baseline | JaRVIS-Prompted |
 |---|---|---|
 | **Agent** | Claude Code | Claude Code |
-| **Model** | Same (default: claude-sonnet-4-20250514) | Same |
+| **Model** | Different (default: claude-sonnet-4-6) | Different |
 | **Task spec** | Same `start.md` | Same `start.md` |
 | **Timeout** | Same (default: 1200s) | Same |
 | **JaRVIS skills** | No | Yes — copied into `.claude/skills/` |
@@ -103,7 +103,7 @@ This is the ground-truth metric: does the generated code actually work? It uses 
 
 ## Supplementary Metric: LLM Judge Scores
 
-Claude Sonnet (`claude-sonnet-4-20250514`) evaluates each workspace against the original specification on three dimensions, each scored 0–10:
+Claude Sonnet (`claude-sonnet-4-6`) evaluates each workspace against the original specification on three dimensions, each scored 0–10:
 
 - **Architectural coherence** — How well-organized is the code? Are modules logically separated? Does the structure match the spec's requirements?
 - **Code quality** — Is the code clean, idiomatic Python? Proper error handling, naming, typing?

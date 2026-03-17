@@ -52,8 +52,12 @@ def cli(verbose: bool) -> None:
 @click.option("--runs", type=int, default=3, help="Runs per task×condition.")
 @click.option("--full", "full_flag", is_flag=True, help="Run all 104 tasks.")
 @click.option("--smoke", "smoke_flag", is_flag=True, help="Quick smoke test.")
-@click.option("--timeout", type=int, default=1200, help="Per-task timeout (seconds).")
+@click.option("--timeout", type=int, default=3600, help="Per-task timeout (seconds).")
+@click.option("--max-turns", type=int, default=None, help="Max conversation turns for Claude.")
+@click.option("--max-budget-usd", type=float, default=None, help="Max budget in USD per task.")
 @click.option("--model", type=str, default=None, help="Claude model override.")
+@click.option("--parallel", type=int, default=1, help="Max concurrent runs (default: 1 = sequential).")
+@click.option("--no-docker", is_flag=True, help="Run Claude without Docker isolation.")
 @click.option(
     "--project-root",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
@@ -73,7 +77,11 @@ def run(
     full_flag: bool,
     smoke_flag: bool,
     timeout: int,
+    max_turns: int | None,
+    max_budget_usd: float | None,
     model: str | None,
+    parallel: int,
+    no_docker: bool,
     project_root: Path | None,
     tasks_from: TextIO | None,
 ) -> None:
@@ -99,9 +107,20 @@ def run(
         conditions=conditions,
         num_runs=runs,
         timeout_seconds=timeout,
+        max_budget_usd=max_budget_usd,
+        max_turns=max_turns,
+        use_docker=not no_docker,
+        max_workers=parallel,
     )
     if model:
         config.model = model
+
+    # Validate config
+    validation_errors = config.validate()
+    if validation_errors:
+        for err in validation_errors:
+            click.echo(f"Error: {err}", err=True)
+        raise click.Abort()
 
     # Resolve task list
     if smoke_flag:
@@ -116,7 +135,19 @@ def run(
         config.tasks = [t for t in lines if t and not t.startswith("#")]
 
     batch = run_full_benchmark(config)
-    click.echo(f"Batch complete: {batch.batch_id} ({len(batch.results)} runs)")
+
+    # Report completion stats
+    total_runs = len(batch.results)
+    assert config.tasks is not None
+    expected_runs = len(config.tasks) * len(config.conditions) * config.num_runs
+    failed_runs = sum(1 for r in batch.results if r.error is not None)
+    timed_out_runs = sum(1 for r in batch.results if r.timed_out)
+
+    click.echo(f"Batch complete: {batch.batch_id} ({total_runs}/{expected_runs} runs)")
+    if failed_runs:
+        click.echo(f"  {failed_runs} run(s) failed with errors")
+    if timed_out_runs:
+        click.echo(f"  {timed_out_runs} run(s) timed out")
 
 
 # ---------------------------------------------------------------------------

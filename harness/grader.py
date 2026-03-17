@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -237,8 +238,34 @@ def _parse_pytest_output(
     )
 
 
+def _ensure_base_image(task_name: str) -> None:
+    """Ensure the NL2RepoBench base image exists, pulling if needed."""
+    image = f"ghcr.io/multimodal-art-projection/nl2repobench/{task_name}:1.0"
+    result = subprocess.run(
+        ["docker", "image", "inspect", image],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode == 0:
+        return
+
+    logger.info("Pulling base image %s", image)
+    result = subprocess.run(
+        ["docker", "pull", image],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to pull base image {image}: {result.stderr}"
+        )
+
+
 def grade_with_docker(run_result: RunResult, config: BenchConfig) -> TestResult:
     """Grade a completed workspace using Docker-based pytest."""
+    _ensure_base_image(run_result.task_name)
     test_data = _load_test_data(run_result.task_name, config)
     staging_dir = _stage_workspace(run_result.workspace_path, test_data)
 
@@ -344,7 +371,7 @@ def grade_with_llm(
 
     client = anthropic.Anthropic()
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=config.judge_model,
         max_tokens=1024,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
@@ -388,6 +415,41 @@ def grade_run(run_result: RunResult, config: BenchConfig) -> GradeResult:
     """Grade a single run with both Docker pytest and LLM judge."""
     test_result: TestResult | None = None
     quality_scores: QualityScores | None = None
+
+    # Skip grading for timed-out or errored runs
+    skip_reason: str | None = None
+    if run_result.timed_out:
+        skip_reason = f"Skipped: run timed out ({run_result.run_id})"
+    elif run_result.error:
+        skip_reason = f"Skipped: run failed with error: {run_result.error}"
+
+    if skip_reason:
+        logger.warning("%s", skip_reason)
+        test_result = TestResult(
+            passed=0,
+            failed=0,
+            errors=0,
+            total=0,
+            success_rate=0.0,
+            command_outputs=[{"note": skip_reason}],
+        )
+        # Save and return early — no point running Docker or LLM judge
+        results_dir = config.results_dir / run_result.run_id
+        results_dir.mkdir(parents=True, exist_ok=True)
+        (results_dir / "test_results.json").write_text(
+            json.dumps(test_result.to_dict(), indent=2), encoding="utf-8"
+        )
+        grade = GradeResult(
+            run_id=run_result.run_id,
+            task_name=run_result.task_name,
+            condition=run_result.condition,
+            test_result=test_result,
+            quality_scores=None,
+        )
+        (results_dir / "grades.json").write_text(
+            json.dumps(grade.to_dict(), indent=2), encoding="utf-8"
+        )
+        return grade
 
     # 1. Docker pytest grading
     try:
@@ -446,9 +508,33 @@ def grade_run(run_result: RunResult, config: BenchConfig) -> GradeResult:
 def grade_batch(
     batch_result: BatchResult, config: BenchConfig
 ) -> list[GradeResult]:
-    """Grade all runs in a batch."""
-    grades: list[GradeResult] = []
-    for run_result in batch_result.results:
-        grade = grade_run(run_result, config)
-        grades.append(grade)
+    """Grade all runs in a batch.
+
+    When config.max_workers > 1, runs are graded concurrently using threads.
+    """
+    total = len(batch_result.results)
+
+    if config.max_workers <= 1:
+        grades: list[GradeResult] = []
+        for run_result in batch_result.results:
+            grade = grade_run(run_result, config)
+            grades.append(grade)
+        return grades
+
+    grades = []
+    completed = 0
+    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+        futures = {
+            executor.submit(grade_run, run_result, config): run_result
+            for run_result in batch_result.results
+        }
+        for future in as_completed(futures):
+            run_result = futures[future]
+            try:
+                grade = future.result()
+                grades.append(grade)
+            except Exception:
+                logger.exception("Grading failed for %s", run_result.run_id)
+            completed += 1
+            logger.info("Graded %d/%d runs", completed, total)
     return grades

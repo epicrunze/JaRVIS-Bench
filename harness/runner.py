@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
@@ -76,17 +77,15 @@ def _scaffold_jarvis_dir(workspace: Path, scaffolding_path: Path) -> None:
         "memories/decisions.md": jarvis_dir / "memories" / "decisions.md",
     }
 
-    # Parse sections: look for ## headings followed by code blocks
-    sections = re.split(r"^## ", content, flags=re.MULTILINE)
-    for section in sections:
-        for filename, filepath in file_map.items():
-            if section.startswith(filename):
-                # Extract the first markdown code block
-                match = re.search(r"```markdown\n(.*?)```", section, re.DOTALL)
-                if match:
-                    filepath.parent.mkdir(parents=True, exist_ok=True)
-                    filepath.write_text(match.group(1), encoding="utf-8")
-                break
+    # For each file, find its ## heading and extract the code block that follows.
+    # We search the full content directly to avoid splitting inside code blocks
+    # (templates like IDENTITY.md contain ## headings that break re.split).
+    for filename, filepath in file_map.items():
+        pattern = rf"^## {re.escape(filename)}\s*\n.*?```markdown\n(.*?)```"
+        match = re.search(pattern, content, re.DOTALL | re.MULTILINE)
+        if match:
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            filepath.write_text(match.group(1), encoding="utf-8")
 
     # Create journal directory
     (jarvis_dir / "journal").mkdir(parents=True, exist_ok=True)
@@ -100,9 +99,9 @@ def _scaffold_jarvis_dir(workspace: Path, scaffolding_path: Path) -> None:
 def build_prompt(task_spec: TaskSpec, condition: Condition) -> str:
     """Build the prompt to send to Claude Code for the given condition."""
     if condition == Condition.BASELINE:
-        return _build_baseline_prompt(task_spec)
+        return _build_baseline_prompt()
     elif condition == Condition.JARVIS_PROMPTED:
-        return _build_jarvis_prompted_prompt(task_spec)
+        return _build_jarvis_prompted_prompt()
     elif condition in (Condition.ORCHESTRATED, Condition.JARVIS_ORCHESTRATED):
         raise NotImplementedError(
             f"Condition {condition.value!r} is not yet implemented."
@@ -111,32 +110,26 @@ def build_prompt(task_spec: TaskSpec, condition: Condition) -> str:
         raise ValueError(f"Unknown condition: {condition!r}")
 
 
-def _build_baseline_prompt(task_spec: TaskSpec) -> str:
-    return f"""You are an expert Python developer. Your task is to create a complete Python project based on the specification below.
-
-Read the specification carefully and implement all required functionality. Create all necessary files, directories, modules, and tests. The project must be installable and all tests must pass.
-
-Work autonomously — implement everything in a single session without asking questions.
-
-## Project Specification
-
-{task_spec.spec_content}"""
-
-
-def _build_jarvis_prompted_prompt(task_spec: TaskSpec) -> str:
-    return f"""You are an expert Python developer. Your task is to create a complete Python project based on the specification below.
+def _build_baseline_prompt() -> str:
+    return """You are an expert Python developer. Your task is to create a complete Python project based on the specification in `start.md` (already present in your working directory).
 
 **Before writing any code**, create a PLAN.md file that breaks down the implementation into logical steps.
 
-As you work through implementation, use `/jarvis-reflect` after completing each major component to capture what you learned, what worked, and what didn't. Aim for 3-5 reflections minimum throughout the task — this helps you maintain coherence across a long implementation.
+Read `start.md` carefully and implement all required functionality. Create all necessary files, directories, modules, and tests. The project must be installable and all tests must pass.
 
-Read the specification carefully and implement all required functionality. Create all necessary files, directories, modules, and tests. The project must be installable and all tests must pass.
+Work autonomously — implement everything in a single session without asking questions."""
 
-Work autonomously — implement everything in a single session without asking questions.
 
-## Project Specification
+def _build_jarvis_prompted_prompt() -> str:
+    return """You are an expert Python developer. Your task is to create a complete Python project based on the specification in `start.md` (already present in your working directory).
 
-{task_spec.spec_content}"""
+**Before writing any code**, create a PLAN.md file that breaks down the implementation into logical steps. At the end of each phase in the plan, include a reminder to run `/jarvis-reflect` before moving on.
+
+As you work through implementation, use `/jarvis-reflect` after completing each phase to capture what you learned, what worked, and what didn't. This helps you maintain coherence across a long implementation.
+
+Read `start.md` carefully and implement all required functionality. Create all necessary files, directories, modules, and tests. The project must be installable and all tests must pass.
+
+Work autonomously — implement everything in a single session without asking questions."""
 
 
 # ---------------------------------------------------------------------------
@@ -145,9 +138,27 @@ Work autonomously — implement everything in a single session without asking qu
 
 
 def invoke_claude(
-    prompt: str, workspace: Path, config: BenchConfig
+    prompt: str, workspace: Path, config: BenchConfig, run_id: str = ""
 ) -> tuple[subprocess.CompletedProcess[str], bool]:
-    """Invoke Claude Code CLI and return (result, timed_out)."""
+    """Invoke Claude Code CLI and return (result, timed_out).
+
+    If config.use_docker is True, runs Claude inside a Docker container.
+    Otherwise, runs as a bare subprocess on the host.
+    """
+    if config.use_docker:
+        from harness.docker import run_claude_in_container
+
+        stdout, stderr, exit_code, timed_out = run_claude_in_container(
+            prompt, workspace, config, run_id
+        )
+        result = subprocess.CompletedProcess(
+            args=["docker", "run", "..."],
+            returncode=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        return result, timed_out
+
     cmd = [
         config.claude_command,
         "-p",
@@ -160,6 +171,8 @@ def invoke_claude(
     ]
     if config.max_budget_usd is not None:
         cmd.extend(["--max-budget-usd", str(config.max_budget_usd)])
+    if config.max_turns is not None:
+        cmd.extend(["--max-turns", str(config.max_turns)])
 
     logger.info("Running Claude in %s (timeout=%ds)", workspace, config.timeout_seconds)
     logger.debug("Command: %s", " ".join(cmd))
@@ -215,11 +228,15 @@ def run_task(
     """Execute a single task under a given condition and return the result."""
     run_id = generate_run_id(task_name, condition)
     workspace = config.workspace_dir / run_id
-    if workspace.exists():
+    try:
+        workspace.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
         raise FileExistsError(f"Workspace already exists: {workspace}")
-    workspace.mkdir(parents=True)
 
     task_spec = load_task_spec(task_name, config)
+
+    # Copy start.md into workspace so Claude can read it as a file
+    shutil.copy2(task_spec.spec_path, workspace / "start.md")
 
     # Set up JaRVIS workspace if applicable
     if condition in (Condition.JARVIS_PROMPTED, Condition.JARVIS_ORCHESTRATED):
@@ -230,7 +247,7 @@ def run_task(
     started_at = datetime.now(timezone.utc).isoformat()
     start_time = time.monotonic()
 
-    result, timed_out = invoke_claude(prompt, workspace, config)
+    result, timed_out = invoke_claude(prompt, workspace, config, run_id=run_id)
 
     elapsed = time.monotonic() - start_time
     finished_at = datetime.now(timezone.utc).isoformat()
@@ -280,40 +297,106 @@ def run_evaluation(
     return result
 
 
+def _run_single(
+    task_name: str,
+    condition: Condition,
+    run_idx: int,
+    config: BenchConfig,
+) -> RunResult:
+    """Execute a single run, returning a sentinel RunResult on failure."""
+    try:
+        return run_evaluation(task_name, condition, config)
+    except Exception as exc:
+        logger.exception(
+            "Failed: task=%s condition=%s run=%d",
+            task_name,
+            condition.value,
+            run_idx + 1,
+        )
+        error_run_id = generate_run_id(task_name, condition)
+        return RunResult(
+            run_id=error_run_id,
+            task_name=task_name,
+            condition=condition,
+            workspace_path=config.workspace_dir / error_run_id,
+            exit_code=-1,
+            wall_clock_seconds=0.0,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            timed_out=False,
+            raw_stdout="",
+            raw_stderr="",
+            claude_output=None,
+            files_generated=[],
+            error=str(exc),
+        )
+
+
 def run_full_benchmark(config: BenchConfig) -> BatchResult:
-    """Run all task x condition x num_runs combinations sequentially."""
+    """Run all task x condition x num_runs combinations.
+
+    When config.max_workers > 1, runs are executed concurrently using threads.
+    """
     batch_id = generate_batch_id()
     task_names = config.tasks if config.tasks else discover_tasks(config)
-    results: list[RunResult] = []
 
+    # Build work items
+    work_items: list[tuple[str, Condition, int]] = []
+    for task_name in task_names:
+        for condition in config.conditions:
+            for run_idx in range(config.num_runs):
+                work_items.append((task_name, condition, run_idx))
+
+    total = len(work_items)
     logger.info(
-        "Starting benchmark %s: %d tasks x %d conditions x %d runs",
+        "Starting benchmark %s: %d tasks x %d conditions x %d runs = %d total "
+        "(max_workers=%d)",
         batch_id,
         len(task_names),
         len(config.conditions),
         config.num_runs,
+        total,
+        config.max_workers,
     )
 
-    for task_name in task_names:
-        for condition in config.conditions:
-            for run_idx in range(config.num_runs):
+    results: list[RunResult] = []
+
+    if config.max_workers <= 1:
+        # Sequential — no thread overhead
+        for i, (task_name, condition, run_idx) in enumerate(work_items, 1):
+            logger.info(
+                "[%d/%d] task=%s condition=%s run=%d",
+                i,
+                total,
+                task_name,
+                condition.value,
+                run_idx + 1,
+            )
+            result = _run_single(task_name, condition, run_idx, config)
+            results.append(result)
+    else:
+        # Parallel via threads (subprocess work is I/O-bound)
+        completed = 0
+        with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _run_single, task_name, condition, run_idx, config
+                ): (task_name, condition, run_idx)
+                for task_name, condition, run_idx in work_items
+            }
+            for future in as_completed(futures):
+                task_name, condition, run_idx = futures[future]
+                result = future.result()
+                results.append(result)
+                completed += 1
                 logger.info(
-                    "Run %d/%d: task=%s condition=%s",
-                    run_idx + 1,
-                    config.num_runs,
+                    "Completed %d/%d: task=%s condition=%s run=%d",
+                    completed,
+                    total,
                     task_name,
                     condition.value,
+                    run_idx + 1,
                 )
-                try:
-                    result = run_evaluation(task_name, condition, config)
-                    results.append(result)
-                except Exception:
-                    logger.exception(
-                        "Failed: task=%s condition=%s run=%d",
-                        task_name,
-                        condition.value,
-                        run_idx + 1,
-                    )
 
     # Save manifest
     manifest_dir = config.results_dir / batch_id

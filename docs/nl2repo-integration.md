@@ -59,15 +59,15 @@ We do NOT need:
 | `config.json` | Task configuration and metadata |
 | `test_files/` | All 104 task directories |
 
-## Integration Plan
+## Implementation
 
-In `harness/grader.py` we will:
+In `harness/grader.py`, the `grade_with_docker()` function:
 
-1. Accept a completed workspace path and task name
-2. Read `test_commands.json` and `test_case_count.txt` from the task directory
-3. Build a Docker image: base image + workspace contents
-4. Run each test command inside the container
-5. Parse pytest output for pass/fail/error counts
-6. Return a structured result with pass rate and raw output
+1. Accepts a completed workspace (via `RunResult`) and loads test configuration from the task directory
+2. Stages the workspace to a temp directory, removing package management files (`setup.py`, `pyproject.toml`, `requirements.txt`, etc.) and test files/directories listed in `test_files.json` — this prevents conflicts with the upstream test environment
+3. Builds a Docker image: NL2Repo-Bench base image + staged workspace contents
+4. Runs each test command from `test_commands.json` inside a container
+5. Parses pytest output for pass/fail/error counts
+6. Returns a `TestResult` with pass rate, counts, and raw command output
 
 This keeps NL2RepoBench unmodified while extracting only the evaluation logic we need.

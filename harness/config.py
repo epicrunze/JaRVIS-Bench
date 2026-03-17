@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -71,6 +72,9 @@ class RunResult:
     # Workspace
     files_generated: list[str]
 
+    # Error (set when run_evaluation fails)
+    error: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -86,6 +90,7 @@ class RunResult:
             "raw_stderr": self.raw_stderr,
             "claude_output": self.claude_output,
             "files_generated": self.files_generated,
+            "error": self.error,
         }
 
 
@@ -181,9 +186,19 @@ class BenchConfig:
     # Claude settings
     claude_command: str = "claude"
     model: str = "claude-sonnet-4-20250514"
-    timeout_seconds: int = 1200
+    timeout_seconds: int = 3600
     max_budget_usd: float | None = None
+    max_turns: int | None = None
     output_format: str = "json"
+
+    # Docker settings
+    use_docker: bool = True
+    docker_image: str = "jarvis-bench-runner:latest"
+    docker_memory: str = "8g"
+    docker_cpus: int = 4
+
+    # LLM judge settings
+    judge_model: str = "claude-sonnet-4-20250514"
 
     # Eval settings
     conditions: list[Condition] = field(
@@ -191,6 +206,7 @@ class BenchConfig:
     )
     num_runs: int = 3
     tasks: list[str] | None = None
+    max_workers: int = 1
 
     # Derived paths — set in __post_init__
     vendor_dir: Path = field(init=False)
@@ -208,6 +224,25 @@ class BenchConfig:
         self.nl2repo_dir = self.vendor_dir / "NL2RepoBench"
         self.jarvis_dir = self.vendor_dir / "JaRVIS"
         self.test_files_dir = self.nl2repo_dir / "test_files"
+
+    def validate(self) -> list[str]:
+        """Validate config paths and Docker availability. Returns list of errors."""
+        errors: list[str] = []
+        if not self.vendor_dir.is_dir():
+            errors.append(f"Vendor directory not found: {self.vendor_dir}")
+        if not self.nl2repo_dir.is_dir():
+            errors.append(f"NL2RepoBench directory not found: {self.nl2repo_dir}")
+        if not self.test_files_dir.is_dir():
+            errors.append(f"Test files directory not found: {self.test_files_dir}")
+        if self.use_docker:
+            from harness.docker import check_docker_available
+
+            if not check_docker_available():
+                errors.append(
+                    "Docker is not available but use_docker=True. "
+                    "Install Docker or pass --no-docker."
+                )
+        return errors
 
 
 def load_task_spec(task_name: str, config: BenchConfig) -> TaskSpec:
@@ -266,15 +301,17 @@ def discover_tasks(config: BenchConfig) -> list[str]:
 
 
 def generate_run_id(task_name: str, condition: Condition) -> str:
-    """Generate a unique run ID: {task}_{condition}_{YYYYMMDD-HHMMSS}."""
+    """Generate a unique run ID: {task}_{condition}_{YYYYMMDD-HHMMSS}_{hex4}."""
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return f"{task_name}_{condition.value}_{timestamp}"
+    suffix = uuid.uuid4().hex[:4]
+    return f"{task_name}_{condition.value}_{timestamp}_{suffix}"
 
 
 def generate_batch_id() -> str:
-    """Generate a unique batch ID: batch_{YYYYMMDD-HHMMSS}."""
+    """Generate a unique batch ID: batch_{YYYYMMDD-HHMMSS}_{hex4}."""
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return f"batch_{timestamp}"
+    suffix = uuid.uuid4().hex[:4]
+    return f"batch_{timestamp}_{suffix}"
 
 
 def load_run_result(run_id: str, config: BenchConfig) -> RunResult:
@@ -297,6 +334,7 @@ def load_run_result(run_id: str, config: BenchConfig) -> RunResult:
         raw_stderr=data["raw_stderr"],
         claude_output=data["claude_output"],
         files_generated=data["files_generated"],
+        error=data.get("error"),
     )
 
 

@@ -12,6 +12,7 @@ from harness.config import (
     load_batch_result,
     load_run_result,
 )
+from harness.docker import check_docker_available
 from harness.grader import grade_batch, grade_run
 from harness.reporter import generate_report, generate_report_from_grades
 from harness.runner import run_evaluation, run_full_benchmark, run_task
@@ -25,6 +26,7 @@ __all__ = [
     "TaskSpec",
     "TaskTestData",
     "TestResult",
+    "check_docker_available",
     "generate_report",
     "generate_report_from_grades",
     "grade_batch",

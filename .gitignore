@@ -6,3 +6,5 @@ vendor/
 __pycache__/
 *.egg-info/
 .venv/
+*.log
+*.txt

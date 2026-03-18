@@ -187,6 +187,7 @@ class BenchConfig:
     claude_command: str = "claude"
     model: str = "claude-sonnet-4-6"
     timeout_seconds: int = 3600
+    idle_timeout_seconds: int = 300  # 5 minutes of no file changes → kill
     max_budget_usd: float | None = None
     max_turns: int | None = None
     output_format: str = "json"
@@ -215,6 +216,7 @@ class BenchConfig:
     nl2repo_dir: Path = field(init=False)
     jarvis_dir: Path = field(init=False)
     test_files_dir: Path = field(init=False)
+    analysis_dir: Path = field(init=False)
 
     def __post_init__(self) -> None:
         self.project_root = self.project_root.resolve()
@@ -224,6 +226,7 @@ class BenchConfig:
         self.nl2repo_dir = self.vendor_dir / "NL2RepoBench"
         self.jarvis_dir = self.vendor_dir / "JaRVIS"
         self.test_files_dir = self.nl2repo_dir / "test_files"
+        self.analysis_dir = self.project_root / "analysis"
 
     def validate(self) -> list[str]:
         """Validate config paths and Docker availability. Returns list of errors."""

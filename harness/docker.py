@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,41 @@ if TYPE_CHECKING:
     from harness.config import BenchConfig
 
 logger = logging.getLogger(__name__)
+
+# Directories to exclude from mtime scanning — these are touched by
+# Claude CLI internals, not by actual agent file-writing work.
+_MTIME_EXCLUDE_DIRS = {".claude-home", ".git"}
+
+
+def _get_latest_mtime(workspace: Path) -> float:
+    """Return the most recent st_mtime across all files in *workspace*.
+
+    Excludes directories listed in ``_MTIME_EXCLUDE_DIRS`` and uses
+    ``os.scandir`` recursively for speed on large workspaces.
+    """
+
+    latest = 0.0
+
+    def _scan(directory: Path) -> None:
+        nonlocal latest
+        try:
+            with os.scandir(directory) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name not in _MTIME_EXCLUDE_DIRS:
+                            _scan(Path(entry.path))
+                    else:
+                        try:
+                            mtime = entry.stat(follow_symlinks=False).st_mtime
+                            if mtime > latest:
+                                latest = mtime
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+
+    _scan(workspace)
+    return latest
 
 
 def check_docker_available() -> bool:
@@ -147,28 +183,63 @@ def run_claude_in_container(
                 f"Failed to start container {container_name}: {start_result.stderr}"
             )
 
-        # Wait for container to finish (with timeout)
+        # Poll for container exit or idle timeout
         timed_out = False
-        try:
-            wait_result = subprocess.run(
-                ["docker", "wait", container_name],
-                capture_output=True,
-                text=True,
-                timeout=config.timeout_seconds,
-            )
-            exit_code = int(wait_result.stdout.strip()) if wait_result.stdout.strip() else -1
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            exit_code = -1
-            logger.warning("Container %s timed out after %ds, killing", container_name, config.timeout_seconds)
-            subprocess.run(
-                ["docker", "kill", container_name],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
+        idle_timed_out = False
+        exit_code = -1
+        start_time = time.monotonic()
+        # Track mtime (epoch-based) and monotonic time separately
+        last_known_mtime = _get_latest_mtime(workspace)
+        last_activity_mono = start_time
 
-        # Capture logs
+        while True:
+            elapsed = time.monotonic() - start_time
+
+            # Check overall timeout
+            if elapsed >= config.timeout_seconds:
+                timed_out = True
+                logger.warning(
+                    "Container %s hit hard timeout after %ds, killing",
+                    container_name, int(elapsed),
+                )
+                break
+
+            # Check if container has exited
+            try:
+                inspect = subprocess.run(
+                    ["docker", "inspect", "--format", "{{.State.Running}}", container_name],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if inspect.stdout.strip() == "false":
+                    wait_result = subprocess.run(
+                        ["docker", "wait", container_name],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    exit_code = int(wait_result.stdout.strip()) if wait_result.stdout.strip() else -1
+                    break
+            except (subprocess.TimeoutExpired, ValueError):
+                pass
+
+            # Check workspace activity — compare mtimes to detect new writes,
+            # but track idle duration on the monotonic clock
+            latest_mtime = _get_latest_mtime(workspace)
+            if latest_mtime > last_known_mtime:
+                last_known_mtime = latest_mtime
+                last_activity_mono = time.monotonic()
+
+            idle_seconds = time.monotonic() - last_activity_mono
+            if idle_seconds >= config.idle_timeout_seconds:
+                idle_timed_out = True
+                timed_out = True
+                logger.warning(
+                    "Container %s idle for %ds (no file changes), killing",
+                    container_name, int(idle_seconds),
+                )
+                break
+
+            time.sleep(10)
+
+        # Capture logs BEFORE killing — killed containers may lose buffered output
         logs_result = subprocess.run(
             ["docker", "logs", container_name],
             capture_output=True,
@@ -177,6 +248,17 @@ def run_claude_in_container(
         )
         stdout = logs_result.stdout
         stderr = logs_result.stderr
+
+        # Now kill if needed
+        if timed_out:
+            timeout_kind = "idle" if idle_timed_out else "hard"
+            logger.info("Killing container %s (%s timeout)", container_name, timeout_kind)
+            subprocess.run(
+                ["docker", "kill", container_name],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
 
         return stdout, stderr, exit_code, timed_out
 

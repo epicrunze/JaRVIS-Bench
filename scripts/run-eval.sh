@@ -23,6 +23,7 @@ Run options (combinable with run modes):
   --condition COND              baseline | jarvis-prompted | both (default: both)
   --runs N                      Runs per task×condition (default: 3)
   --timeout SECS                Per-task timeout (default: 1200)
+  --idle-timeout SECS           Idle timeout - kill if no file changes (default: 300)
   --model MODEL                 Claude model override
   -v, --verbose                 Enable debug logging
   -h, --help                    Show this help
@@ -70,6 +71,8 @@ while [[ $# -gt 0 ]]; do
             ARGS+=("--runs" "$2"); shift 2 ;;
         --timeout)
             ARGS+=("--timeout" "$2"); shift 2 ;;
+        --idle-timeout)
+            ARGS+=("--idle-timeout" "$2"); shift 2 ;;
         --model)
             ARGS+=("--model" "$2"); shift 2 ;;
         -v|--verbose)

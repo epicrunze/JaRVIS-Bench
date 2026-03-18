@@ -2,6 +2,7 @@ results/*
 !results/.gitkeep
 workspaces/*
 !workspaces/.gitkeep
+analysis/
 vendor/
 __pycache__/
 *.egg-info/

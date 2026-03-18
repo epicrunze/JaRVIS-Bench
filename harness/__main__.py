@@ -8,6 +8,14 @@ from typing import TextIO
 
 import click
 
+from harness.analyzer import (
+    AnalysisMetadata,
+    compute_tier2_partitions,
+    format_tier1_prompt,
+    prepare_batch_contexts,
+    save_context_file,
+    save_metadata,
+)
 from harness.config import (
     BenchConfig,
     Condition,
@@ -53,6 +61,7 @@ def cli(verbose: bool) -> None:
 @click.option("--full", "full_flag", is_flag=True, help="Run all 104 tasks.")
 @click.option("--smoke", "smoke_flag", is_flag=True, help="Quick smoke test.")
 @click.option("--timeout", type=int, default=3600, help="Per-task timeout (seconds).")
+@click.option("--idle-timeout", type=int, default=300, help="Kill if no file changes for N seconds (default: 300).")
 @click.option("--max-turns", type=int, default=None, help="Max conversation turns for Claude.")
 @click.option("--max-budget-usd", type=float, default=None, help="Max budget in USD per task.")
 @click.option("--model", type=str, default=None, help="Claude model override.")
@@ -77,6 +86,7 @@ def run(
     full_flag: bool,
     smoke_flag: bool,
     timeout: int,
+    idle_timeout: int,
     max_turns: int | None,
     max_budget_usd: float | None,
     model: str | None,
@@ -107,6 +117,7 @@ def run(
         conditions=conditions,
         num_runs=runs,
         timeout_seconds=timeout,
+        idle_timeout_seconds=idle_timeout,
         max_budget_usd=max_budget_usd,
         max_turns=max_turns,
         use_docker=not no_docker,
@@ -219,6 +230,60 @@ def report(batch_id: str, project_root: Path | None) -> None:
     config = BenchConfig(project_root=root)
     report_path = generate_report(batch_id, config)
     click.echo(f"Report written to {report_path}")
+
+
+# ---------------------------------------------------------------------------
+# analyze
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--batch-id", required=True, type=str, help="Batch ID to analyze.")
+@click.option(
+    "--project-root",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Project root (default: cwd).",
+)
+def analyze(batch_id: str, project_root: Path | None) -> None:
+    """Prepare analysis contexts for a graded batch."""
+    from datetime import datetime, timezone
+
+    root = project_root or Path.cwd()
+    config = BenchConfig(project_root=root)
+
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    contexts = prepare_batch_contexts(batch_id, config)
+    if not contexts:
+        click.echo(f"No runs found for batch {batch_id}", err=True)
+        raise click.Abort()
+
+    # Save formatted prompts
+    for ctx in contexts:
+        prompt = format_tier1_prompt(ctx)
+        save_context_file(batch_id, ctx.run_id, prompt, config)
+
+    partitions = compute_tier2_partitions([c.run_id for c in contexts])
+
+    # Collect unique conditions and tasks
+    conditions = sorted({c.condition for c in contexts})
+    tasks = sorted({c.task_name for c in contexts})
+
+    metadata = AnalysisMetadata(
+        batch_id=batch_id,
+        total_runs=len(contexts),
+        group_count=len(partitions),
+        partitions=partitions,
+        started_at=started_at,
+        finished_at=None,
+        conditions=conditions,
+        tasks=tasks,
+    )
+    save_metadata(batch_id, metadata, config)
+
+    click.echo(f"Prepared {len(contexts)} contexts in analysis/{batch_id}/contexts/")
+    click.echo(f"Group partitions: {len(partitions)} groups")
 
 
 if __name__ == "__main__":

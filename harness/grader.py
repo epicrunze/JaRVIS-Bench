@@ -164,21 +164,31 @@ def _run_tests_in_container(
         # Execute each test command
         for command in test_commands:
             logger.info("Executing: %s", command)
-            result = subprocess.run(
-                [
-                    "docker", "exec", container_name,
-                    "sh", "-c", command,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            command_results.append({
-                "command": command,
-                "exit_code": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            })
+            try:
+                result = subprocess.run(
+                    [
+                        "docker", "exec", container_name,
+                        "sh", "-c", command,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                command_results.append({
+                    "command": command,
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                })
+            except subprocess.TimeoutExpired as exc:
+                logger.warning("Command timed out after 600s: %s", command)
+                command_results.append({
+                    "command": command,
+                    "exit_code": -1,
+                    "stdout": str(exc.stdout) if exc.stdout else "",
+                    "stderr": str(exc.stderr) if exc.stderr else "",
+                    "timed_out": True,
+                })
     finally:
         _cleanup_docker(run_id)
 
@@ -359,9 +369,7 @@ Return ONLY a JSON object with keys: architectural_coherence, code_quality, comp
 def grade_with_llm(
     run_result: RunResult, task_spec: TaskSpec, config: BenchConfig
 ) -> QualityScores:
-    """Grade workspace quality using LLM-as-judge."""
-    import anthropic
-
+    """Grade workspace quality using LLM-as-judge via Claude CLI."""
     workspace_files = _read_workspace_files(run_result.workspace_path)
     file_tree = sorted(workspace_files.keys())
 
@@ -369,24 +377,40 @@ def grade_with_llm(
         task_spec.spec_content, file_tree, workspace_files
     )
 
-    client = anthropic.Anthropic()
-    response = client.messages.create(
-        model=config.judge_model,
-        max_tokens=1024,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
+    # Combine system + user prompt for claude -p (single prompt, no system param)
+    full_prompt = f"{system_prompt}\n\n{user_prompt}"
+
+    cmd = [
+        config.claude_command,
+        "-p",
+        full_prompt,
+        "--output-format", "json",
+        "--model", config.judge_model,
+        "--max-turns", "1",
+        "--dangerously-skip-permissions",
+        "--settings", json.dumps({"disableAllHooks": True}),
+    ]
+
+    logger.info("Running LLM judge for %s", run_result.run_id)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=300,
     )
 
-    # Extract text from response
-    first_block = response.content[0]
-    if not hasattr(first_block, "text"):
-        raise ValueError(f"Unexpected response block type: {type(first_block)}")
-    response_text: str = first_block.text  # type: ignore[union-attr]
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Claude CLI judge failed for {run_result.run_id}: {result.stderr}"
+        )
+
+    # Parse the Claude CLI JSON envelope to extract the result text
+    cli_output = json.loads(result.stdout)
+    response_text = cli_output.get("result", "").strip()
 
     # Parse JSON — handle possible markdown fencing
-    json_text = response_text.strip()
+    json_text = response_text
     if json_text.startswith("```"):
-        # Strip markdown code fences
         json_text = re.sub(r"^```\w*\n?", "", json_text)
         json_text = re.sub(r"\n?```$", "", json_text)
 

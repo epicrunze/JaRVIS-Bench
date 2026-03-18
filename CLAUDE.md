@@ -27,10 +27,16 @@ mypy harness/
 ./scripts/run-eval.sh --task <name>        # Single task
 ./scripts/run-eval.sh --full               # Full benchmark
 
-# Python module entry points (not yet implemented)
+# Python module entry points
 python -m harness.runner --task <name> --condition jarvis
 python -m harness.grader --run-id <id>
 python -m harness.reporter --batch-id <id>
+
+# Prepare analysis contexts for a batch (data prep only)
+python -m harness analyze --batch-id <batch_id>
+
+# Run full hierarchical analysis (interactive skill)
+# /analyze-batch <batch_id>
 ```
 
 ## Architecture

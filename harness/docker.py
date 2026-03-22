@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,6 +20,45 @@ logger = logging.getLogger(__name__)
 # Directories to exclude from mtime scanning — these are touched by
 # Claude CLI internals, not by actual agent file-writing work.
 _MTIME_EXCLUDE_DIRS = {".claude-home", ".git"}
+
+_refresh_lock = threading.Lock()
+
+
+def is_auth_error(stdout: str) -> bool:
+    """Check if Claude output indicates an authentication failure."""
+    try:
+        data = json.loads(stdout)
+        result_text = data.get("result", "")
+        return "authentication_error" in result_text or "401" in result_text
+    except (json.JSONDecodeError, TypeError):
+        # Fall back to raw string check for non-JSON output
+        return "authentication_error" in stdout or "401" in stdout
+
+
+def refresh_host_credentials(claude_command: str = "claude") -> bool:
+    """Launch a minimal claude session on the host to trigger OAuth token refresh.
+
+    Uses a lock so multiple workers don't refresh simultaneously.
+    Returns True if refresh succeeded.
+    """
+    with _refresh_lock:
+        logger.info("Refreshing host credentials via '%s -p hi'...", claude_command)
+        try:
+            result = subprocess.run(
+                [claude_command, "-p", "hi", "--output-format", "json", "--max-turns", "1"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            logger.error("Host credential refresh failed: %s", exc)
+            return False
+        if result.returncode == 0:
+            logger.info("Host credential refresh succeeded")
+            return True
+        else:
+            logger.error("Host credential refresh failed: %s", result.stderr[:200])
+            return False
 
 
 def _get_latest_mtime(workspace: Path) -> float:

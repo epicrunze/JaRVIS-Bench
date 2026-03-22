@@ -25,7 +25,7 @@ from harness.config import (
 )
 from harness.grader import grade_batch, grade_run
 from harness.reporter import generate_report
-from harness.runner import run_full_benchmark
+from harness.runner import resume_benchmark, run_full_benchmark
 
 logger = logging.getLogger("harness")
 
@@ -79,6 +79,12 @@ def cli(verbose: bool) -> None:
     default=None,
     help="Read task names from file (one per line).",
 )
+@click.option(
+    "--resume-batch",
+    type=str,
+    default=None,
+    help="Resume a previous batch by re-running transient failures.",
+)
 def run(
     task_name: str | None,
     condition: str,
@@ -94,16 +100,44 @@ def run(
     no_docker: bool,
     project_root: Path | None,
     tasks_from: TextIO | None,
+    resume_batch: str | None,
 ) -> None:
     """Run evaluation(s) on NL2Repo-Bench tasks."""
+    root = project_root or Path.cwd()
+
+    # Resume mode: re-run transient failures from an existing batch
+    if resume_batch:
+        config = BenchConfig(
+            project_root=root,
+            timeout_seconds=timeout,
+            idle_timeout_seconds=idle_timeout,
+            max_budget_usd=max_budget_usd,
+            max_turns=max_turns,
+            use_docker=not no_docker,
+            max_workers=parallel,
+        )
+        if model:
+            config.model = model
+
+        batch = resume_benchmark(resume_batch, config)
+
+        total_runs = len(batch.results)
+        failed_runs = sum(1 for r in batch.results if r.error is not None)
+        timed_out_runs = sum(1 for r in batch.results if r.timed_out)
+
+        click.echo(f"Resume complete: {batch.batch_id} ({total_runs} total runs)")
+        if failed_runs:
+            click.echo(f"  {failed_runs} run(s) still failed")
+        if timed_out_runs:
+            click.echo(f"  {timed_out_runs} run(s) timed out")
+        return
+
     # Validate: exactly one source
     sources = sum([task_name is not None, full_flag, smoke_flag, tasks_from is not None])
     if sources != 1:
         raise click.UsageError(
             "Specify exactly one of --task, --full, --smoke, or --tasks-from."
         )
-
-    root = project_root or Path.cwd()
 
     # Resolve conditions
     if condition == "both":

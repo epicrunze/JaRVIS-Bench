@@ -300,39 +300,81 @@ def run_evaluation(
     return result
 
 
+def _is_auth_error_result(result: RunResult) -> bool:
+    """Check if a RunResult indicates an authentication failure."""
+    from harness.docker import is_auth_error
+
+    return is_auth_error(result.raw_stdout)
+
+
+def _cleanup_failed_run(result: RunResult, config: BenchConfig) -> None:
+    """Remove workspace and results dirs for a failed run so retry can start fresh."""
+    if result.workspace_path.exists():
+        shutil.rmtree(result.workspace_path, ignore_errors=True)
+    result_dir = config.results_dir / result.run_id
+    if result_dir.exists():
+        shutil.rmtree(result_dir, ignore_errors=True)
+
+
 def _run_single(
     task_name: str,
     condition: Condition,
     run_idx: int,
     config: BenchConfig,
 ) -> RunResult:
-    """Execute a single run, returning a sentinel RunResult on failure."""
-    try:
-        return run_evaluation(task_name, condition, config)
-    except Exception as exc:
-        logger.exception(
-            "Failed: task=%s condition=%s run=%d",
-            task_name,
-            condition.value,
-            run_idx + 1,
-        )
-        error_run_id = generate_run_id(task_name, condition)
-        return RunResult(
-            run_id=error_run_id,
-            task_name=task_name,
-            condition=condition,
-            workspace_path=config.workspace_dir / error_run_id,
-            exit_code=-1,
-            wall_clock_seconds=0.0,
-            started_at=datetime.now(timezone.utc).isoformat(),
-            finished_at=datetime.now(timezone.utc).isoformat(),
-            timed_out=False,
-            raw_stdout="",
-            raw_stderr="",
-            claude_output=None,
-            files_generated=[],
-            error=str(exc),
-        )
+    """Execute a single run, with auth-error retry logic."""
+    max_retries = config.max_auth_retries
+    for attempt in range(max_retries + 1):
+        try:
+            result = run_evaluation(task_name, condition, config)
+            if _is_auth_error_result(result) and attempt < max_retries:
+                logger.warning(
+                    "Auth error on %s (attempt %d/%d), refreshing credentials...",
+                    task_name,
+                    attempt + 1,
+                    max_retries + 1,
+                )
+                from harness.docker import refresh_host_credentials
+
+                refresh_host_credentials(config.claude_command)
+                _cleanup_failed_run(result, config)
+                continue
+            return result
+        except Exception as exc:
+            if attempt < max_retries:
+                logger.warning(
+                    "Exception on %s (attempt %d/%d): %s",
+                    task_name,
+                    attempt + 1,
+                    max_retries + 1,
+                    exc,
+                )
+                continue
+            logger.exception(
+                "Failed: task=%s condition=%s run=%d",
+                task_name,
+                condition.value,
+                run_idx + 1,
+            )
+            error_run_id = generate_run_id(task_name, condition)
+            return RunResult(
+                run_id=error_run_id,
+                task_name=task_name,
+                condition=condition,
+                workspace_path=config.workspace_dir / error_run_id,
+                exit_code=-1,
+                wall_clock_seconds=0.0,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                timed_out=False,
+                raw_stdout="",
+                raw_stderr="",
+                claude_output=None,
+                files_generated=[],
+                error=str(exc),
+            )
+    # Should never reach here, but satisfy type checker
+    raise RuntimeError("Unreachable")
 
 
 def run_full_benchmark(config: BenchConfig) -> BatchResult:
@@ -416,4 +458,159 @@ def run_full_benchmark(config: BenchConfig) -> BatchResult:
         batch_id=batch_id,
         results=results,
         manifest_path=manifest_path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Batch resume
+# ---------------------------------------------------------------------------
+
+
+def _is_transient_failure(run: dict[str, Any]) -> bool:
+    """Check if a run failed due to transient issues (auth, network) vs real failure.
+
+    Criteria: short wall clock (<30s) with non-zero exit and auth error markers,
+    OR an error sentinel (exception during run_evaluation).
+    """
+    stdout = run.get("raw_stdout", "")
+    # Auth error in stdout
+    if "authentication_error" in stdout or "401" in stdout:
+        return True
+    # Error sentinel from _run_single exception handling
+    if run.get("error") and run.get("wall_clock_seconds", 0) < 30:
+        return True
+    return False
+
+
+def resume_benchmark(batch_id: str, config: BenchConfig) -> BatchResult:
+    """Resume a batch by re-running only transient failures.
+
+    Loads the existing manifest, identifies failed runs, re-executes them,
+    and updates the manifest in place.
+    """
+    manifest_path = config.results_dir / batch_id / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Batch manifest not found: {manifest_path}")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    # Separate good runs from transient failures
+    good_run_dicts: list[dict[str, Any]] = []
+    failed_work: list[tuple[str, Condition, int]] = []
+    # Track how many good runs exist per (task, condition)
+    good_counts: dict[tuple[str, str], int] = {}
+
+    for run in manifest["runs"]:
+        if _is_transient_failure(run):
+            # Clean up workspace and result dir for failed run
+            ws = Path(run.get("workspace_path", ""))
+            if ws.exists():
+                shutil.rmtree(ws, ignore_errors=True)
+            result_dir = config.results_dir / run["run_id"]
+            if result_dir.exists():
+                shutil.rmtree(result_dir, ignore_errors=True)
+        else:
+            good_run_dicts.append(run)
+            key = (run["task_name"], run["condition"])
+            good_counts[key] = good_counts.get(key, 0) + 1
+
+    # Determine how many runs we need per (task, condition)
+    # Count total runs per key in the original manifest to know expected count
+    total_counts: dict[tuple[str, str], int] = {}
+    for run in manifest["runs"]:
+        key = (run["task_name"], run["condition"])
+        total_counts[key] = total_counts.get(key, 0) + 1
+
+    # Build work items for missing runs
+    for key, expected in total_counts.items():
+        existing = good_counts.get(key, 0)
+        needed = expected - existing
+        task_name, condition_str = key
+        condition = Condition(condition_str)
+        for run_idx in range(needed):
+            failed_work.append((task_name, condition, existing + run_idx))
+
+    if not failed_work:
+        logger.info("No transient failures found in batch %s — nothing to resume", batch_id)
+        # Reload RunResults from good dicts
+        good_results = [_run_dict_to_result(d) for d in good_run_dicts]
+        return BatchResult(
+            batch_id=batch_id,
+            results=good_results,
+            manifest_path=manifest_path,
+        )
+
+    total = len(failed_work)
+    logger.info(
+        "Resuming batch %s: %d transient failures to re-run (max_workers=%d)",
+        batch_id,
+        total,
+        config.max_workers,
+    )
+
+    new_results: list[RunResult] = []
+
+    if config.max_workers <= 1:
+        for i, (task_name, condition, run_idx) in enumerate(failed_work, 1):
+            logger.info(
+                "[%d/%d] RESUME task=%s condition=%s run=%d",
+                i, total, task_name, condition.value, run_idx + 1,
+            )
+            result = _run_single(task_name, condition, run_idx, config)
+            new_results.append(result)
+    else:
+        completed = 0
+        with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _run_single, task_name, condition, run_idx, config
+                ): (task_name, condition, run_idx)
+                for task_name, condition, run_idx in failed_work
+            }
+            for future in as_completed(futures):
+                task_name, condition, run_idx = futures[future]
+                result = future.result()
+                new_results.append(result)
+                completed += 1
+                logger.info(
+                    "RESUME completed %d/%d: task=%s condition=%s run=%d",
+                    completed, total, task_name, condition.value, run_idx + 1,
+                )
+
+    # Merge: good runs from original + new results
+    all_results = [_run_dict_to_result(d) for d in good_run_dicts] + new_results
+
+    # Update manifest in place
+    manifest_data = {
+        "batch_id": batch_id,
+        "total_runs": len(all_results),
+        "resumed_from": manifest.get("batch_id", batch_id),
+        "runs": [r.to_dict() for r in all_results],
+    }
+    manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+
+    return BatchResult(
+        batch_id=batch_id,
+        results=all_results,
+        manifest_path=manifest_path,
+    )
+
+
+def _run_dict_to_result(d: dict[str, Any]) -> RunResult:
+    """Convert a manifest run dict back to a RunResult."""
+    return RunResult(
+        run_id=d["run_id"],
+        task_name=d["task_name"],
+        condition=Condition(d["condition"]),
+        workspace_path=Path(d["workspace_path"]),
+        exit_code=d["exit_code"],
+        wall_clock_seconds=d["wall_clock_seconds"],
+        started_at=d["started_at"],
+        finished_at=d["finished_at"],
+        timed_out=d["timed_out"],
+        raw_stdout=d["raw_stdout"],
+        raw_stderr=d["raw_stderr"],
+        claude_output=d["claude_output"],
+        files_generated=d["files_generated"],
+        error=d.get("error"),
     )

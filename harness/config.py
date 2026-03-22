@@ -188,6 +188,7 @@ class BenchConfig:
     model: str = "claude-sonnet-4-6"
     timeout_seconds: int = 3600
     idle_timeout_seconds: int = 300  # 5 minutes of no file changes → kill
+    max_auth_retries: int = 2  # retries after auth (401) failures
     max_budget_usd: float | None = None
     max_turns: int | None = None
     output_format: str = "json"

@@ -16,6 +16,7 @@ class Condition(str, Enum):
 
     BASELINE = "baseline"
     JARVIS_PROMPTED = "jarvis-prompted"
+    OPUS_JARVIS = "opus-jarvis"
     ORCHESTRATED = "orchestrated"
     JARVIS_ORCHESTRATED = "jarvis-orchestrated"
 
@@ -72,8 +73,9 @@ class RunResult:
     # Workspace
     files_generated: list[str]
 
-    # Error (set when run_evaluation fails)
+    # Optional fields (must have defaults — dataclass ordering rule)
     error: str | None = None
+    idle_timed_out: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +88,7 @@ class RunResult:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "timed_out": self.timed_out,
+            "idle_timed_out": self.idle_timed_out,
             "raw_stdout": self.raw_stdout,
             "raw_stderr": self.raw_stderr,
             "claude_output": self.claude_output,
@@ -105,6 +108,16 @@ class TestResult:
     success_rate: float
     command_outputs: list[dict[str, Any]]
 
+    # Diagnostic fields (added for grading accuracy)
+    skipped: int = 0
+    xfailed: int = 0
+    xpassed: int = 0
+    warnings: int = 0
+    collected: int = 0  # actual pytest collected count
+    expected_total: int = 0  # from test_case_count.txt
+    pip_install_failed: bool = False
+    command_timed_out: bool = False
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
@@ -113,6 +126,14 @@ class TestResult:
             "total": self.total,
             "success_rate": self.success_rate,
             "command_outputs": self.command_outputs,
+            "skipped": self.skipped,
+            "xfailed": self.xfailed,
+            "xpassed": self.xpassed,
+            "warnings": self.warnings,
+            "collected": self.collected,
+            "expected_total": self.expected_total,
+            "pip_install_failed": self.pip_install_failed,
+            "command_timed_out": self.command_timed_out,
         }
 
 

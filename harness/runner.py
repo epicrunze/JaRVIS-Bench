@@ -99,7 +99,7 @@ def build_prompt(condition: Condition) -> str:
     """Build the prompt to send to Claude Code for the given condition."""
     if condition == Condition.BASELINE:
         return _build_baseline_prompt()
-    elif condition == Condition.JARVIS_PROMPTED:
+    elif condition in (Condition.JARVIS_PROMPTED, Condition.OPUS_JARVIS):
         return _build_jarvis_prompted_prompt()
     elif condition in (Condition.ORCHESTRATED, Condition.JARVIS_ORCHESTRATED):
         raise NotImplementedError(
@@ -139,8 +139,8 @@ Work autonomously — implement everything in a single session without asking qu
 
 def invoke_claude(
     prompt: str, workspace: Path, config: BenchConfig, run_id: str = ""
-) -> tuple[subprocess.CompletedProcess[str], bool]:
-    """Invoke Claude Code CLI and return (result, timed_out).
+) -> tuple[subprocess.CompletedProcess[str], bool, bool]:
+    """Invoke Claude Code CLI and return (result, timed_out, idle_timed_out).
 
     If config.use_docker is True, runs Claude inside a Docker container.
     Otherwise, runs as a bare subprocess on the host.
@@ -148,7 +148,7 @@ def invoke_claude(
     if config.use_docker:
         from harness.docker import run_claude_in_container
 
-        stdout, stderr, exit_code, timed_out = run_claude_in_container(
+        stdout, stderr, exit_code, timed_out, idle_timed_out = run_claude_in_container(
             prompt, workspace, config, run_id
         )
         result = subprocess.CompletedProcess(
@@ -157,7 +157,7 @@ def invoke_claude(
             stdout=stdout,
             stderr=stderr,
         )
-        return result, timed_out
+        return result, timed_out, idle_timed_out
 
     cmd = [
         config.claude_command,
@@ -195,7 +195,7 @@ def invoke_claude(
             stderr=str(exc.stderr) if exc.stderr else "",
         )
 
-    return result, timed_out
+    return result, timed_out, False
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +242,7 @@ def run_task(
     shutil.copy2(task_spec.spec_path, workspace / "start.md")
 
     # Set up JaRVIS workspace if applicable
-    if condition in (Condition.JARVIS_PROMPTED, Condition.JARVIS_ORCHESTRATED):
+    if condition in (Condition.JARVIS_PROMPTED, Condition.JARVIS_ORCHESTRATED, Condition.OPUS_JARVIS):
         setup_jarvis_workspace(workspace, config)
 
     prompt = build_prompt(condition)
@@ -250,7 +250,9 @@ def run_task(
     started_at = datetime.now(timezone.utc).isoformat()
     start_time = time.monotonic()
 
-    result, timed_out = invoke_claude(prompt, workspace, config, run_id=run_id)
+    result, timed_out, idle_timed_out = invoke_claude(
+        prompt, workspace, config, run_id=run_id
+    )
 
     elapsed = time.monotonic() - start_time
     finished_at = datetime.now(timezone.utc).isoformat()
@@ -275,6 +277,7 @@ def run_task(
         started_at=started_at,
         finished_at=finished_at,
         timed_out=timed_out,
+        idle_timed_out=idle_timed_out,
         raw_stdout=result.stdout,
         raw_stderr=result.stderr,
         claude_output=claude_output,
@@ -449,6 +452,8 @@ def run_full_benchmark(config: BenchConfig) -> BatchResult:
     manifest_path = manifest_dir / "manifest.json"
     manifest_data = {
         "batch_id": batch_id,
+        "model": config.model,
+        "conditions": [c.value for c in config.conditions],
         "total_runs": len(results),
         "runs": [r.to_dict() for r in results],
     }
@@ -466,23 +471,55 @@ def run_full_benchmark(config: BenchConfig) -> BatchResult:
 # ---------------------------------------------------------------------------
 
 
-def _is_transient_failure(run: dict[str, Any]) -> bool:
-    """Check if a run failed due to transient issues (auth, network) vs real failure.
+def _is_transient_failure(run: dict[str, Any], *, include_timeouts: bool = False) -> bool:
+    """Check if a run failed due to transient issues (auth, usage limit, etc.).
 
-    Criteria: short wall clock (<30s) with non-zero exit and auth error markers,
-    OR an error sentinel (exception during run_evaluation).
+    Criteria: claude_output errors (usage limit, content filter, auth),
+    idle-timeout kills, short-lived exceptions, or optionally all timeouts.
     """
+    # Use structured claude_output for reliable error detection
+    co = run.get("claude_output") or {}
+    if co.get("is_error"):
+        result_text = (co.get("result") or "").lower()
+        # Usage limit
+        if "hit your limit" in result_text or "you've hit" in result_text:
+            return True
+        # Content filtering / API errors
+        if "blocked by content filtering" in result_text:
+            return True
+        # Auth errors
+        if "authentication_error" in result_text or "unauthorized" in result_text:
+            return True
+
+    # Fallback for runs without parsed claude_output (process killed, no JSON)
+    if not co and run.get("exit_code", 0) != 0:
+        lower_stdout = (run.get("raw_stdout") or "").lower()
+        if "hit your limit" in lower_stdout or "you've hit" in lower_stdout:
+            return True
+
+    # Idle-timeout kill (new field) or heuristic for old batches:
+    # timed_out + empty stdout + short wall clock = likely false idle kill
+    if run.get("idle_timed_out"):
+        return True
     stdout = run.get("raw_stdout", "")
-    # Auth error in stdout
-    if "authentication_error" in stdout or "401" in stdout:
+    if (
+        run.get("timed_out")
+        and not stdout.strip()
+        and run.get("wall_clock_seconds", 9999) < 400
+    ):
         return True
     # Error sentinel from _run_single exception handling
     if run.get("error") and run.get("wall_clock_seconds", 0) < 30:
         return True
+    # Optionally include timed-out runs
+    if include_timeouts and run.get("timed_out"):
+        return True
     return False
 
 
-def resume_benchmark(batch_id: str, config: BenchConfig) -> BatchResult:
+def resume_benchmark(
+    batch_id: str, config: BenchConfig, *, include_timeouts: bool = False
+) -> BatchResult:
     """Resume a batch by re-running only transient failures.
 
     Loads the existing manifest, identifies failed runs, re-executes them,
@@ -501,7 +538,7 @@ def resume_benchmark(batch_id: str, config: BenchConfig) -> BatchResult:
     good_counts: dict[tuple[str, str], int] = {}
 
     for run in manifest["runs"]:
-        if _is_transient_failure(run):
+        if _is_transient_failure(run, include_timeouts=include_timeouts):
             # Clean up workspace and result dir for failed run
             ws = Path(run.get("workspace_path", ""))
             if ws.exists():
@@ -583,6 +620,8 @@ def resume_benchmark(batch_id: str, config: BenchConfig) -> BatchResult:
     # Update manifest in place
     manifest_data = {
         "batch_id": batch_id,
+        "model": config.model,
+        "conditions": [c.value for c in config.conditions],
         "total_runs": len(all_results),
         "resumed_from": manifest.get("batch_id", batch_id),
         "runs": [r.to_dict() for r in all_results],
@@ -608,6 +647,7 @@ def _run_dict_to_result(d: dict[str, Any]) -> RunResult:
         started_at=d["started_at"],
         finished_at=d["finished_at"],
         timed_out=d["timed_out"],
+        idle_timed_out=d.get("idle_timed_out", False),
         raw_stdout=d["raw_stdout"],
         raw_stderr=d["raw_stderr"],
         claude_output=d["claude_output"],

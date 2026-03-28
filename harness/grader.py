@@ -17,12 +17,9 @@ from harness.config import (
     BatchResult,
     BenchConfig,
     GradeResult,
-    QualityScores,
     RunResult,
-    TaskSpec,
     TaskTestData,
     TestResult,
-    load_task_spec,
     load_task_test_data,
 )
 
@@ -47,19 +44,6 @@ PACKAGE_FILES = {
     "MANIFEST.in",
 }
 
-# Directories/files to skip when reading workspace for LLM judge
-SKIP_DIRS = {".claude", ".jarvis", "__pycache__", ".git", ".venv", "node_modules"}
-
-# Binary file extensions to skip
-BINARY_EXTENSIONS = {
-    ".pyc", ".pyo", ".so", ".o", ".a", ".dylib", ".dll",
-    ".exe", ".bin", ".pkl", ".pickle", ".npy", ".npz",
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg",
-    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z",
-    ".whl", ".egg", ".db", ".sqlite", ".sqlite3",
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx",
-}
-
 
 # ---------------------------------------------------------------------------
 # Docker-based pytest grading
@@ -71,13 +55,21 @@ def _load_test_data(task_name: str, config: BenchConfig) -> TaskTestData:
     return load_task_test_data(task_name, config)
 
 
+_STAGE_SKIP_DIRS = {".venv", "__pycache__", ".pytest_cache", ".git", ".jarvis", ".claude", "node_modules"}
+
+
 def _stage_workspace(
     workspace_path: Path, test_data: TaskTestData
 ) -> Path:
     """Copy workspace to a temp dir, removing package and test files."""
     staging_dir = Path(tempfile.mkdtemp(prefix=f"jarvis-bench-stage-{test_data.task_name}-"))
     workspace_copy = staging_dir / "workspace"
-    shutil.copytree(workspace_path, workspace_copy, dirs_exist_ok=True)
+    shutil.copytree(
+        workspace_path,
+        workspace_copy,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns(*_STAGE_SKIP_DIRS),
+    )
 
     # Remove package management files (walk all dirs, matching post_processor.py)
     for root, _dirs, files in os.walk(workspace_copy):
@@ -104,7 +96,7 @@ def _write_dockerfile(staging_dir: Path, task_name: str) -> Path:
     """Write a Dockerfile into the staging directory."""
     dockerfile_path = staging_dir / "Dockerfile"
     dockerfile_content = f"""\
-FROM ghcr.io/multimodal-art-projection/nl2repobench/{task_name}:1.0
+FROM ghcr.io/multimodal-art-projection/nl2repobench/{task_name.lower()}:1.0
 
 COPY workspace /workspace
 
@@ -121,7 +113,7 @@ CMD ["tail", "-f", "/dev/null"]
 def _build_test_image(staging_dir: Path, task_name: str, run_id: str) -> str:
     """Build a Docker image for testing. Returns the image tag."""
     _write_dockerfile(staging_dir, task_name)
-    image_tag = f"jarvis-bench-test-{run_id}"
+    image_tag = f"jarvis-bench-test-{run_id}".lower()
 
     logger.info("Building Docker image %s", image_tag)
     result = subprocess.run(
@@ -142,7 +134,7 @@ def _run_tests_in_container(
     image_tag: str, test_commands: list[str], run_id: str
 ) -> list[dict[str, Any]]:
     """Run test commands inside a Docker container."""
-    container_name = f"jarvis-bench-{run_id}"
+    container_name = f"jarvis-bench-{run_id}".lower()
     command_results: list[dict[str, Any]] = []
 
     try:
@@ -161,8 +153,24 @@ def _run_tests_in_container(
         )
         logger.info("Started test container %s", container_name)
 
+        # Install pytest-timeout to handle hanging individual tests
+        logger.info("Installing pytest-timeout in container")
+        subprocess.run(
+            [
+                "docker", "exec", container_name,
+                "pip", "install", "pytest-timeout",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
         # Execute each test command
         for command in test_commands:
+            # Inject per-test timeout for pytest commands
+            if "pytest" in command.lower() and "--timeout" not in command:
+                command = command + " --timeout=120"
+
             logger.info("Executing: %s", command)
             try:
                 result = subprocess.run(
@@ -172,7 +180,7 @@ def _run_tests_in_container(
                     ],
                     capture_output=True,
                     text=True,
-                    timeout=600,
+                    timeout=1800,
                 )
                 command_results.append({
                     "command": command,
@@ -181,7 +189,7 @@ def _run_tests_in_container(
                     "stderr": result.stderr,
                 })
             except subprocess.TimeoutExpired as exc:
-                logger.warning("Command timed out after 600s: %s", command)
+                logger.warning("Command timed out after 1800s: %s", command)
                 command_results.append({
                     "command": command,
                     "exit_code": -1,
@@ -197,8 +205,8 @@ def _run_tests_in_container(
 
 def _cleanup_docker(run_id: str) -> None:
     """Remove container and image for a run."""
-    container_name = f"jarvis-bench-{run_id}"
-    image_tag = f"jarvis-bench-test-{run_id}"
+    container_name = f"jarvis-bench-{run_id}".lower()
+    image_tag = f"jarvis-bench-test-{run_id}".lower()
 
     for cmd in [
         ["docker", "rm", "-f", container_name],
@@ -210,32 +218,96 @@ def _cleanup_docker(run_id: str) -> None:
             logger.warning("Cleanup command failed: %s", " ".join(cmd))
 
 
+def _parse_summary_line(line: str) -> dict[str, int]:
+    """Parse pytest summary line like '=== 5 passed, 2 failed, 1 error in 3.2s ==='."""
+    counts: dict[str, int] = {}
+    # Match patterns like "5 passed", "2 failed", "1 error", "3 skipped", etc.
+    for m in re.finditer(r"(\d+) (passed|failed|error|errors|skipped|xfailed|xpassed|warnings?|deselected)", line):
+        key = m.group(2)
+        # Normalize: "errors" → "error", "warnings" → "warning"
+        if key == "errors":
+            key = "error"
+        if key == "warnings":
+            key = "warning"
+        counts[key] = counts.get(key, 0) + int(m.group(1))
+    return counts
+
+
+def _parse_collected_count(output: str) -> int:
+    """Parse 'collected N items' from pytest output. Returns 0 if not found."""
+    # Match "collected N items" or "collected N items / M errors"
+    m = re.search(r"collected (\d+) items?", output)
+    return int(m.group(1)) if m else 0
+
+
 def _parse_pytest_output(
     command_results: list[dict[str, Any]], total_test_cases: int
 ) -> TestResult:
-    """Parse pytest output from command results."""
+    """Parse pytest output from command results.
+
+    Parses only the LAST pytest summary line (=== ... ===) per command to avoid
+    double-counting from subprocess pytest invocations (e.g., pytest-cov tests).
+    Uses the actual 'collected N items' count as total when available.
+    """
     passed = 0
     failed = 0
     errors = 0
+    skipped = 0
+    xfailed = 0
+    xpassed = 0
+    warnings = 0
+    collected = 0
+    pip_install_failed = False
+    command_timed_out = False
 
     for result in command_results:
-        command = result["command"]
+        command = result.get("command", "")
+
+        # Track pip install failures
         if "pytest" not in command.lower():
+            if result.get("exit_code", 0) != 0 and "pip" in command.lower():
+                pip_install_failed = True
             continue
 
-        output = result.get("stdout", "") + "\n" + result.get("stderr", "")
-        for line in output.split("\n"):
-            m = re.search(r"(\d+) passed", line)
-            if m:
-                passed += int(m.group(1))
-            m = re.search(r"(\d+) failed", line)
-            if m:
-                failed += int(m.group(1))
-            m = re.search(r"(\d+) error", line)
-            if m:
-                errors += int(m.group(1))
+        # Track command timeouts
+        if result.get("timed_out"):
+            command_timed_out = True
 
-    total = total_test_cases if total_test_cases > 0 else (passed + failed + errors)
+        output = result.get("stdout", "") + "\n" + result.get("stderr", "")
+
+        # Parse collected count from this command
+        cmd_collected = _parse_collected_count(output)
+        collected += cmd_collected
+
+        # Find the LAST summary line (=== ... ===) to avoid intermediate counts
+        summary_lines = []
+        for line in output.split("\n"):
+            # Pytest summary lines are bordered with '=' chars
+            stripped = line.strip()
+            if re.match(r"^=+\s.*\s=+$", stripped) and re.search(
+                r"(passed|failed|error|no tests ran)", stripped
+            ):
+                summary_lines.append(stripped)
+
+        if summary_lines:
+            # Use only the last summary line
+            counts = _parse_summary_line(summary_lines[-1])
+            passed += counts.get("passed", 0)
+            failed += counts.get("failed", 0)
+            errors += counts.get("error", 0)
+            skipped += counts.get("skipped", 0)
+            xfailed += counts.get("xfailed", 0)
+            xpassed += counts.get("xpassed", 0)
+            warnings += counts.get("warning", 0)
+
+    # Use collected count as total when available, fall back to test_case_count.txt
+    if collected > 0:
+        total = collected
+    elif total_test_cases > 0:
+        total = total_test_cases
+    else:
+        total = passed + failed + errors
+
     success_rate = min(passed / total, 1.0) if total > 0 else 0.0
 
     return TestResult(
@@ -245,12 +317,20 @@ def _parse_pytest_output(
         total=total,
         success_rate=success_rate,
         command_outputs=command_results,
+        skipped=skipped,
+        xfailed=xfailed,
+        xpassed=xpassed,
+        warnings=warnings,
+        collected=collected,
+        expected_total=total_test_cases,
+        pip_install_failed=pip_install_failed,
+        command_timed_out=command_timed_out,
     )
 
 
 def _ensure_base_image(task_name: str) -> None:
     """Ensure the NL2RepoBench base image exists, pulling if needed."""
-    image = f"ghcr.io/multimodal-art-projection/nl2repobench/{task_name}:1.0"
+    image = f"ghcr.io/multimodal-art-projection/nl2repobench/{task_name.lower()}:1.0"
     result = subprocess.run(
         ["docker", "image", "inspect", image],
         capture_output=True,
@@ -291,154 +371,50 @@ def grade_with_docker(run_result: RunResult, config: BenchConfig) -> TestResult:
 
 
 # ---------------------------------------------------------------------------
-# LLM-as-judge grading
-# ---------------------------------------------------------------------------
-
-
-def _read_workspace_files(
-    workspace_path: Path, max_file_size: int = 100_000
-) -> dict[str, str]:
-    """Read text files from workspace, skipping binary and internal dirs."""
-    files: dict[str, str] = {}
-
-    for path in sorted(workspace_path.rglob("*")):
-        if not path.is_file():
-            continue
-
-        rel = path.relative_to(workspace_path)
-        # Skip internal directories
-        if rel.parts and rel.parts[0] in SKIP_DIRS:
-            continue
-        # Skip binary extensions
-        if path.suffix.lower() in BINARY_EXTENSIONS:
-            continue
-
-        try:
-            content = path.read_text(encoding="utf-8", errors="replace")
-            if len(content) > max_file_size:
-                content = content[:max_file_size] + "\n... [truncated]"
-            files[str(rel)] = content
-        except Exception:
-            logger.debug("Could not read file: %s", path)
-
-    return files
-
-
-def _build_judge_prompt(
-    spec_content: str, file_tree: list[str], file_contents: dict[str, str]
-) -> tuple[str, str]:
-    """Build system and user prompts for the LLM judge."""
-    system_prompt = (
-        "You are a code quality evaluator. You assess Python projects against "
-        "their specifications on three dimensions. Be fair but rigorous. "
-        "Return your evaluation as a JSON object with exactly these keys: "
-        "architectural_coherence (0-10), code_quality (0-10), completeness (0-10), "
-        'rationale (string). No markdown fencing, just raw JSON.'
-    )
-
-    files_section = "\n".join(f"  {f}" for f in file_tree)
-
-    contents_section = ""
-    for path, content in file_contents.items():
-        contents_section += f"\n### {path}\n```\n{content}\n```\n"
-
-    user_prompt = f"""\
-## Original Specification
-
-{spec_content}
-
-## Generated File Tree
-
-{files_section}
-
-## File Contents
-{contents_section}
-
-## Evaluation Rubric
-
-- **architectural_coherence** (0-10): How well-organized is the code? Are modules logically separated? Is there a clear structure that matches the spec's requirements?
-- **code_quality** (0-10): Is the code clean, idiomatic Python? Proper error handling, naming, typing?
-- **completeness** (0-10): How much of the specification is actually implemented? Are all required features present?
-
-Rate each dimension 0-10 and provide a brief rationale explaining your scores.
-Return ONLY a JSON object with keys: architectural_coherence, code_quality, completeness, rationale."""
-
-    return system_prompt, user_prompt
-
-
-def grade_with_llm(
-    run_result: RunResult, task_spec: TaskSpec, config: BenchConfig
-) -> QualityScores:
-    """Grade workspace quality using LLM-as-judge via Claude CLI."""
-    workspace_files = _read_workspace_files(run_result.workspace_path)
-    file_tree = sorted(workspace_files.keys())
-
-    system_prompt, user_prompt = _build_judge_prompt(
-        task_spec.spec_content, file_tree, workspace_files
-    )
-
-    # Combine system + user prompt for claude -p (single prompt, no system param)
-    full_prompt = f"{system_prompt}\n\n{user_prompt}"
-
-    cmd = [
-        config.claude_command,
-        "-p",
-        full_prompt,
-        "--output-format", "json",
-        "--model", config.judge_model,
-        "--max-turns", "1",
-        "--dangerously-skip-permissions",
-        "--settings", json.dumps({"disableAllHooks": True}),
-    ]
-
-    logger.info("Running LLM judge for %s", run_result.run_id)
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Claude CLI judge failed for {run_result.run_id}: {result.stderr}"
-        )
-
-    # Parse the Claude CLI JSON envelope to extract the result text
-    cli_output = json.loads(result.stdout)
-    response_text = cli_output.get("result", "").strip()
-
-    # Parse JSON — handle possible markdown fencing
-    json_text = response_text
-    if json_text.startswith("```"):
-        json_text = re.sub(r"^```\w*\n?", "", json_text)
-        json_text = re.sub(r"\n?```$", "", json_text)
-
-    scores = json.loads(json_text)
-
-    arch = float(scores["architectural_coherence"])
-    quality = float(scores["code_quality"])
-    completeness = float(scores["completeness"])
-    overall = round((arch + quality + completeness) / 3, 2)
-
-    return QualityScores(
-        architectural_coherence=arch,
-        code_quality=quality,
-        completeness=completeness,
-        overall=overall,
-        rationale=scores.get("rationale", ""),
-    )
-
-
-# ---------------------------------------------------------------------------
 # Integration
 # ---------------------------------------------------------------------------
 
 
-def grade_run(run_result: RunResult, config: BenchConfig) -> GradeResult:
-    """Grade a single run with both Docker pytest and LLM judge."""
+def _load_existing_grade(grades_path: Path, run_result: RunResult) -> GradeResult:
+    """Load a previously saved GradeResult from disk."""
+    data = json.loads(grades_path.read_text(encoding="utf-8"))
+    tr = data.get("test_result")
+    loaded_result = TestResult(
+        passed=tr.get("passed", 0),
+        failed=tr.get("failed", 0),
+        errors=tr.get("errors", 0),
+        total=tr.get("total", 0),
+        success_rate=tr.get("success_rate", 0.0),
+        command_outputs=tr.get("command_outputs", []),
+        skipped=tr.get("skipped", 0),
+        xfailed=tr.get("xfailed", 0),
+        xpassed=tr.get("xpassed", 0),
+        warnings=tr.get("warnings", 0),
+        collected=tr.get("collected", 0),
+        expected_total=tr.get("expected_total", 0),
+        pip_install_failed=tr.get("pip_install_failed", False),
+        command_timed_out=tr.get("command_timed_out", False),
+    ) if tr else None
+    return GradeResult(
+        run_id=run_result.run_id,
+        task_name=run_result.task_name,
+        condition=run_result.condition,
+        test_result=loaded_result,
+        quality_scores=None,
+    )
+
+
+def grade_run(run_result: RunResult, config: BenchConfig, *, force: bool = False) -> GradeResult:
+    """Grade a single run with Docker pytest."""
+    results_dir = config.results_dir / run_result.run_id
+    grades_path = results_dir / "grades.json"
+
+    # Skip if already graded (unless --force)
+    if not force and grades_path.exists():
+        logger.info("Skipping %s (already graded, use --force to re-grade)", run_result.run_id)
+        return _load_existing_grade(grades_path, run_result)
+
     test_result: TestResult | None = None
-    quality_scores: QualityScores | None = None
 
     # Skip grading for timed-out or errored runs
     skip_reason: str | None = None
@@ -457,8 +433,6 @@ def grade_run(run_result: RunResult, config: BenchConfig) -> GradeResult:
             success_rate=0.0,
             command_outputs=[{"note": skip_reason}],
         )
-        # Save and return early — no point running Docker or LLM judge
-        results_dir = config.results_dir / run_result.run_id
         results_dir.mkdir(parents=True, exist_ok=True)
         (results_dir / "test_results.json").write_text(
             json.dumps(test_result.to_dict(), indent=2), encoding="utf-8"
@@ -475,7 +449,7 @@ def grade_run(run_result: RunResult, config: BenchConfig) -> GradeResult:
         )
         return grade
 
-    # 1. Docker pytest grading
+    # Docker pytest grading
     try:
         test_result = grade_with_docker(run_result, config)
         logger.info(
@@ -488,20 +462,7 @@ def grade_run(run_result: RunResult, config: BenchConfig) -> GradeResult:
     except Exception:
         logger.exception("Docker grading failed for %s", run_result.run_id)
 
-    # 2. LLM judge grading
-    try:
-        task_spec = load_task_spec(run_result.task_name, config)
-        quality_scores = grade_with_llm(run_result, task_spec, config)
-        logger.info(
-            "LLM grading complete for %s: overall=%.1f",
-            run_result.run_id,
-            quality_scores.overall,
-        )
-    except Exception:
-        logger.exception("LLM grading failed for %s", run_result.run_id)
-
-    # 3. Save results
-    results_dir = config.results_dir / run_result.run_id
+    # Save results
     results_dir.mkdir(parents=True, exist_ok=True)
 
     if test_result is not None:
@@ -509,17 +470,12 @@ def grade_run(run_result: RunResult, config: BenchConfig) -> GradeResult:
             json.dumps(test_result.to_dict(), indent=2), encoding="utf-8"
         )
 
-    if quality_scores is not None:
-        (results_dir / "quality_scores.json").write_text(
-            json.dumps(quality_scores.to_dict(), indent=2), encoding="utf-8"
-        )
-
     grade = GradeResult(
         run_id=run_result.run_id,
         task_name=run_result.task_name,
         condition=run_result.condition,
         test_result=test_result,
-        quality_scores=quality_scores,
+        quality_scores=None,
     )
 
     (results_dir / "grades.json").write_text(
@@ -530,7 +486,7 @@ def grade_run(run_result: RunResult, config: BenchConfig) -> GradeResult:
 
 
 def grade_batch(
-    batch_result: BatchResult, config: BenchConfig
+    batch_result: BatchResult, config: BenchConfig, *, force: bool = False
 ) -> list[GradeResult]:
     """Grade all runs in a batch.
 
@@ -541,7 +497,7 @@ def grade_batch(
     if config.max_workers <= 1:
         grades: list[GradeResult] = []
         for run_result in batch_result.results:
-            grade = grade_run(run_result, config)
+            grade = grade_run(run_result, config, force=force)
             grades.append(grade)
         return grades
 
@@ -549,7 +505,7 @@ def grade_batch(
     completed = 0
     with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
         futures = {
-            executor.submit(grade_run, run_result, config): run_result
+            executor.submit(grade_run, run_result, config, force=force): run_result
             for run_result in batch_result.results
         }
         for future in as_completed(futures):

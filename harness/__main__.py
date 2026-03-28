@@ -53,7 +53,7 @@ def cli(verbose: bool) -> None:
 @click.option("--task", "task_name", type=str, default=None, help="Single task name.")
 @click.option(
     "--condition",
-    type=click.Choice(["baseline", "jarvis-prompted", "both"], case_sensitive=False),
+    type=click.Choice(["baseline", "jarvis-prompted", "opus-jarvis", "both"], case_sensitive=False),
     default="both",
     help="Condition(s) to run.",
 )
@@ -85,6 +85,12 @@ def cli(verbose: bool) -> None:
     default=None,
     help="Resume a previous batch by re-running transient failures.",
 )
+@click.option(
+    "--include-timeouts",
+    is_flag=True,
+    default=False,
+    help="When resuming, also re-run timed-out tasks.",
+)
 def run(
     task_name: str | None,
     condition: str,
@@ -101,6 +107,7 @@ def run(
     project_root: Path | None,
     tasks_from: TextIO | None,
     resume_batch: str | None,
+    include_timeouts: bool,
 ) -> None:
     """Run evaluation(s) on NL2Repo-Bench tasks."""
     root = project_root or Path.cwd()
@@ -119,7 +126,7 @@ def run(
         if model:
             config.model = model
 
-        batch = resume_benchmark(resume_batch, config)
+        batch = resume_benchmark(resume_batch, config, include_timeouts=include_timeouts)
 
         total_runs = len(batch.results)
         failed_runs = sum(1 for r in batch.results if r.error is not None)
@@ -159,6 +166,8 @@ def run(
     )
     if model:
         config.model = model
+    elif Condition.OPUS_JARVIS in conditions:
+        config.model = "claude-opus-4-6"
 
     # Validate config
     validation_errors = config.validate()
@@ -203,6 +212,8 @@ def run(
 @cli.command()
 @click.option("--run-id", type=str, default=None, help="Grade a single run.")
 @click.option("--batch-id", type=str, default=None, help="Grade all runs in a batch.")
+@click.option("--parallel", type=int, default=1, help="Max concurrent grading jobs (default: 1).")
+@click.option("--force", is_flag=True, default=False, help="Re-grade runs even if grades.json exists.")
 @click.option(
     "--project-root",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
@@ -212,6 +223,8 @@ def run(
 def grade(
     run_id: str | None,
     batch_id: str | None,
+    parallel: int,
+    force: bool,
     project_root: Path | None,
 ) -> None:
     """Grade completed evaluation run(s)."""
@@ -221,16 +234,16 @@ def grade(
         raise click.UsageError("Specify only one of --run-id or --batch-id.")
 
     root = project_root or Path.cwd()
-    config = BenchConfig(project_root=root)
+    config = BenchConfig(project_root=root, max_workers=parallel)
 
     if run_id:
         result = load_run_result(run_id, config)
-        grade_result = grade_run(result, config)
+        grade_result = grade_run(result, config, force=force)
         click.echo(f"Graded run {run_id}: pass_rate={_pass_rate(grade_result)}")
     else:
         assert batch_id is not None
         batch = load_batch_result(batch_id, config)
-        grades = grade_batch(batch, config)
+        grades = grade_batch(batch, config, force=force)
         click.echo(f"Graded batch {batch_id}: {len(grades)} runs")
 
 

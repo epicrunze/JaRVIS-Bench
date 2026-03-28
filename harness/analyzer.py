@@ -12,10 +12,49 @@ from harness.config import (
     BenchConfig,
     load_task_spec,
 )
-from harness.grader import _read_workspace_files
 from harness.reporter import _load_grade_result, _load_manifest
 
 logger = logging.getLogger(__name__)
+
+# Directories/files to skip when reading workspace files
+_SKIP_DIRS = {".claude", ".jarvis", "__pycache__", ".git", ".venv", "node_modules"}
+
+# Binary file extensions to skip
+_BINARY_EXTENSIONS = {
+    ".pyc", ".pyo", ".so", ".o", ".a", ".dylib", ".dll",
+    ".exe", ".bin", ".pkl", ".pickle", ".npy", ".npz",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z",
+    ".whl", ".egg", ".db", ".sqlite", ".sqlite3",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+}
+
+
+def _read_workspace_files(
+    workspace_path: Path, max_file_size: int = 100_000
+) -> dict[str, str]:
+    """Read text files from workspace, skipping binary and internal dirs."""
+    files: dict[str, str] = {}
+
+    for path in sorted(workspace_path.rglob("*")):
+        if not path.is_file():
+            continue
+
+        rel = path.relative_to(workspace_path)
+        if rel.parts and rel.parts[0] in _SKIP_DIRS:
+            continue
+        if path.suffix.lower() in _BINARY_EXTENSIONS:
+            continue
+
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+            if len(content) > max_file_size:
+                content = content[:max_file_size] + "\n... [truncated]"
+            files[str(rel)] = content
+        except Exception:
+            logger.debug("Could not read file: %s", path)
+
+    return files
 
 
 # ---------------------------------------------------------------------------

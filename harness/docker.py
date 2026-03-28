@@ -17,9 +17,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Directories to exclude from mtime scanning — these are touched by
-# Claude CLI internals, not by actual agent file-writing work.
-_MTIME_EXCLUDE_DIRS = {".claude-home", ".git"}
+# Directories to exclude from mtime scanning.
+# .git is always excluded. Inside .claude-home, only noisy/static subdirs
+# are excluded — subagent activity under projects/ must be scanned.
+_MTIME_EXCLUDE_DIRS = {".git"}
+_CLAUDE_HOME_EXCLUDE = {"plugins", "session-env"}
 
 _refresh_lock = threading.Lock()
 
@@ -66,18 +68,27 @@ def _get_latest_mtime(workspace: Path) -> float:
 
     Excludes directories listed in ``_MTIME_EXCLUDE_DIRS`` and uses
     ``os.scandir`` recursively for speed on large workspaces.
+    Inside ``.claude-home/``, only noisy/static subdirs are excluded
+    so that subagent activity (projects/, backups/, etc.) is visible.
     """
 
     latest = 0.0
 
-    def _scan(directory: Path) -> None:
+    def _scan(directory: Path, exclude_set: set[str]) -> None:
         nonlocal latest
         try:
             with os.scandir(directory) as it:
                 for entry in it:
                     if entry.is_dir(follow_symlinks=False):
-                        if entry.name not in _MTIME_EXCLUDE_DIRS:
-                            _scan(Path(entry.path))
+                        if entry.name in exclude_set:
+                            continue
+                        # Inside .claude-home, use the tighter exclude set
+                        child_excludes = (
+                            _CLAUDE_HOME_EXCLUDE
+                            if entry.name == ".claude-home"
+                            else exclude_set
+                        )
+                        _scan(Path(entry.path), child_excludes)
                     else:
                         try:
                             mtime = entry.stat(follow_symlinks=False).st_mtime
@@ -88,7 +99,7 @@ def _get_latest_mtime(workspace: Path) -> float:
         except OSError:
             pass
 
-    _scan(workspace)
+    _scan(workspace, _MTIME_EXCLUDE_DIRS)
     return latest
 
 
@@ -142,10 +153,10 @@ def run_claude_in_container(
     workspace: Path,
     config: BenchConfig,
     run_id: str,
-) -> tuple[str, str, int, bool]:
+) -> tuple[str, str, int, bool, bool]:
     """Run Claude Code inside a Docker container.
 
-    Returns (stdout, stderr, exit_code, timed_out).
+    Returns (stdout, stderr, exit_code, timed_out, idle_timed_out).
     """
     # Ensure image exists
     dockerfile_dir = config.project_root / "docker"
@@ -301,7 +312,7 @@ def run_claude_in_container(
                 timeout=10,
             )
 
-        return stdout, stderr, exit_code, timed_out
+        return stdout, stderr, exit_code, timed_out, idle_timed_out
 
     finally:
         # Remove copied auth files from workspace
